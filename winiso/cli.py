@@ -1,0 +1,304 @@
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+from rich.console import Console
+from rich.table import Table
+
+from .api import PRODUCTS, APIError, MicrosoftDownloadAPI
+from .catalog import (
+    fetch_catalog,
+    get_download_link_from_catalog,
+    get_languages_from_catalog,
+)
+from .download import download_file
+from .models import DownloadLink, Language
+
+console = Console()
+
+ARCH_ALIASES = {"x64": "x64", "x86_64": "x64", "amd64": "x64", "arm64": "ARM64", "aarch64": "ARM64"}
+
+
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(
+        prog="winiso",
+        description="Download Windows ISOs from Microsoft - cross-platform",
+    )
+    sub = parser.add_subparsers(dest="command")
+
+    list_parser = sub.add_parser("list", help="List available products and languages")
+    list_parser.add_argument("--version", choices=["10", "11"], help="Show languages for this version")
+    list_parser.add_argument("--arch", default="x64", help="Architecture: x64 or ARM64 (default: x64)")
+    list_parser.add_argument("--json", action="store_true", help="Output as JSON")
+
+    dl_parser = sub.add_parser("download", help="Download a Windows ISO")
+    dl_parser.add_argument("--version", choices=["10", "11"], help="Windows version")
+    dl_parser.add_argument("--lang", help="Language (e.g. 'English' or 'en-us')")
+    dl_parser.add_argument("--arch", default="x64", help="Architecture: x64 or ARM64 (default: x64)")
+    dl_parser.add_argument("-o", "--output", type=Path, default=Path("."), help="Output directory")
+    dl_parser.add_argument("--iso", action="store_true", help="Use ISO API (default: ESD from catalog)")
+
+    args = parser.parse_args(argv)
+
+    if args.command is None:
+        _interactive_flow()
+    elif args.command == "list":
+        _list_command(args)
+    elif args.command == "download":
+        _download_command(args)
+
+
+def _normalize_arch(arch: str) -> str:
+    return ARCH_ALIASES.get(arch.lower(), arch)
+
+
+# --- Interactive flow ---
+
+
+def _interactive_flow() -> None:
+    console.print("[bold]winiso[/bold] - Windows ISO Downloader\n")
+
+    version_key = _pick_version()
+    arch = _pick_arch()
+
+    console.print(f"\nFetching catalog...")
+    try:
+        entries = fetch_catalog(version_key)
+    except Exception as e:
+        console.print(f"[red]Failed to fetch catalog: {e}[/red]")
+        console.print("[dim]Make sure 'cabextract' is installed (brew install cabextract)[/dim]")
+        sys.exit(1)
+
+    languages = get_languages_from_catalog(entries, arch)
+    if not languages:
+        console.print(f"[red]No languages found for {arch}[/red]")
+        sys.exit(1)
+
+    language = _pick_language(languages)
+    link = get_download_link_from_catalog(entries, language.id, arch)
+    if not link:
+        console.print("[red]No download link found[/red]")
+        sys.exit(1)
+
+    output_dir = _pick_output_dir()
+    output_path = output_dir / link.filename
+
+    _print_download_info(link)
+    download_file(link.url, output_path, expected_size=link.size, console=console)
+
+
+def _pick_version() -> str:
+    console.print("Select Windows version:\n")
+    options = [("windows11", "Windows 11"), ("windows10", "Windows 10")]
+    for i, (_, name) in enumerate(options, 1):
+        console.print(f"  [bold cyan]{i}[/bold cyan]) {name}")
+    console.print()
+    while True:
+        choice = console.input("[bold]Choice[/bold] [1]: ").strip()
+        if choice in ("", "1"):
+            return options[0][0]
+        if choice == "2":
+            return options[1][0]
+        console.print("[red]Please enter 1 or 2[/red]")
+
+
+def _pick_arch() -> str:
+    console.print("\nSelect architecture:\n")
+    options = ["x64", "ARM64"]
+    for i, arch in enumerate(options, 1):
+        console.print(f"  [bold cyan]{i}[/bold cyan]) {arch}")
+    console.print()
+    while True:
+        choice = console.input("[bold]Choice[/bold] [1]: ").strip()
+        if choice in ("", "1"):
+            return options[0]
+        if choice == "2":
+            return options[1]
+        console.print("[red]Please enter 1 or 2[/red]")
+
+
+def _pick_language(languages: list[Language]) -> Language:
+    english_first = sorted(
+        languages,
+        key=lambda l: (
+            0 if l.id == "en-us" else
+            1 if "en-" in l.id else 2,
+            l.name,
+        ),
+    )
+    console.print(f"\nSelect language ({len(english_first)} available):\n")
+    for i, lang in enumerate(english_first, 1):
+        console.print(f"  [bold cyan]{i:>3}[/bold cyan]) {lang.name}")
+    console.print()
+    while True:
+        choice = console.input("[bold]Choice[/bold] [1]: ").strip()
+        if choice == "":
+            return english_first[0]
+        try:
+            idx = int(choice) - 1
+            if 0 <= idx < len(english_first):
+                return english_first[idx]
+        except ValueError:
+            pass
+        console.print(f"[red]Please enter a number between 1 and {len(english_first)}[/red]")
+
+
+def _pick_output_dir() -> Path:
+    default = Path.cwd()
+    path_str = console.input(f"\n[bold]Save to directory[/bold] [{default}]: ").strip()
+    if not path_str:
+        return default
+    p = Path(path_str).expanduser().resolve()
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def _print_download_info(link: DownloadLink) -> None:
+    console.print(f"\n[bold]{link.filename}[/bold]")
+    if link.size:
+        gb = link.size / 1024 / 1024 / 1024
+        console.print(f"Size: {gb:.1f} GB")
+    if link.filename.endswith(".esd"):
+        console.print("[dim]Format: ESD (Windows installation image)[/dim]")
+        console.print("[dim]To convert to ISO, use wimlib: wimlib-imagex export ...[/dim]")
+    console.print()
+
+
+# --- List command ---
+
+
+def _list_command(args: argparse.Namespace) -> None:
+    arch = _normalize_arch(args.arch)
+
+    if args.version is None:
+        table = Table(title="Available Windows Versions")
+        table.add_column("Version", style="bold")
+        table.add_column("Architectures")
+        for key, prod in PRODUCTS.items():
+            archs = ", ".join(e["arch"] for e in prod["editions"])
+            table.add_row(key.replace("windows", ""), archs)
+        console.print(table)
+        console.print("\nUse [bold]winiso list --version 11[/bold] to see available languages.")
+        return
+
+    version_key = f"windows{args.version}"
+    if not args.json:
+        console.print(f"Fetching catalog for Windows {args.version} ({arch})...")
+
+    try:
+        entries = fetch_catalog(version_key)
+    except Exception as e:
+        console.print(f"[red]Error: {e}[/red]", stderr=True)
+        sys.exit(1)
+
+    languages = get_languages_from_catalog(entries, arch)
+
+    if args.json:
+        import json
+        data = [{"name": l.name, "code": l.id, "filename": l.friendly_filename} for l in languages]
+        print(json.dumps(data, indent=2))
+        return
+
+    table = Table(title=f"Languages for Windows {args.version} ({arch})")
+    table.add_column("#", style="dim")
+    table.add_column("Language", style="bold")
+    table.add_column("Code", style="dim")
+    table.add_column("Filename")
+    for i, lang in enumerate(languages, 1):
+        table.add_row(str(i), lang.name, lang.id, lang.friendly_filename or "")
+    console.print(table)
+
+
+# --- Download command ---
+
+
+def _download_command(args: argparse.Namespace) -> None:
+    if not args.version:
+        console.print("[red]--version is required for non-interactive download[/red]")
+        console.print("Usage: [bold]winiso download --version 11 --lang en-us[/bold]")
+        sys.exit(1)
+
+    version_key = f"windows{args.version}"
+    arch = _normalize_arch(args.arch)
+    output_dir = args.output.expanduser().resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.iso:
+        _download_iso(version_key, arch, args.lang, output_dir)
+    else:
+        _download_esd(version_key, arch, args.lang, output_dir)
+
+
+def _download_esd(version_key: str, arch: str, lang_filter: str | None, output_dir: Path) -> None:
+    console.print(f"Fetching catalog...")
+    entries = fetch_catalog(version_key)
+    languages = get_languages_from_catalog(entries, arch)
+
+    language = _resolve_language(languages, lang_filter)
+    link = get_download_link_from_catalog(entries, language.id, arch)
+    if not link:
+        console.print("[red]No download link found.[/red]")
+        sys.exit(1)
+
+    output_path = output_dir / link.filename
+    _print_download_info(link)
+    download_file(link.url, output_path, expected_size=link.size, console=console)
+
+
+def _download_iso(version_key: str, arch: str, lang_filter: str | None, output_dir: Path) -> None:
+    product = PRODUCTS.get(version_key)
+    if not product:
+        console.print(f"[red]Unknown version: {version_key}[/red]")
+        sys.exit(1)
+
+    edition = next((e for e in product["editions"] if e["arch"] == arch), product["editions"][0])
+
+    with MicrosoftDownloadAPI() as api:
+        console.print(f"Fetching languages for [bold]{edition['name']}[/bold]...")
+        try:
+            languages = api.get_languages(edition["id"])
+        except APIError as e:
+            console.print(f"[red]API error: {e.message}[/red]")
+            console.print("[dim]Try without --iso flag to use the catalog instead.[/dim]")
+            sys.exit(1)
+
+        language = _resolve_language(languages, lang_filter)
+
+        console.print(f"Fetching download link for [bold]{language.name}[/bold]...")
+        try:
+            links = api.get_download_links(language.sku_id, product["segment"])
+        except APIError as e:
+            console.print(f"[red]API error: {e.message}[/red]")
+            console.print("[dim]Microsoft's anti-bot may have blocked the request. Try without --iso.[/dim]")
+            sys.exit(1)
+
+    if not links:
+        console.print("[red]No download links returned.[/red]")
+        sys.exit(1)
+
+    link = links[0]
+    filename = language.friendly_filename or link.filename
+    output_path = output_dir / filename
+    console.print(f"\nDownloading [bold]{filename}[/bold]...\n")
+    download_file(link.url, output_path, console=console)
+
+
+def _resolve_language(languages: list[Language], lang_filter: str | None) -> Language:
+    if lang_filter:
+        lf = lang_filter.lower()
+        match = next(
+            (l for l in languages if lf in l.name.lower() or lf == l.id.lower()),
+            None,
+        )
+        if not match:
+            console.print(f"[red]Language '{lang_filter}' not found.[/red]")
+            console.print("Available: " + ", ".join(f"{l.name} ({l.id})" for l in languages[:10]) + "...")
+            sys.exit(1)
+        return match
+
+    return next(
+        (l for l in languages if l.id == "en-us" or "english" in l.name.lower()),
+        languages[0],
+    )
