@@ -2,7 +2,7 @@ use thiserror::Error;
 
 #[derive(Error, Debug)]
 pub enum Error {
-    #[error("API error: {message}")]
+    #[error("API error: {message}\n  Details: {details}")]
     Api { message: String, details: String },
 
     #[error("{}", friendly_http_error(.0))]

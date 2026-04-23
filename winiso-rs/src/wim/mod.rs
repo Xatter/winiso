@@ -26,9 +26,9 @@ pub struct SplitPlan {
     header: WimHeader,
     entries: Vec<LookupEntry>,
     xml_data: Vec<u8>,
-    lt_size: u64,
     parts: Vec<Vec<usize>>,
     assignments: Vec<(u16, u64)>, // (part_number, new_offset) per entry
+    boot_metadata_idx: Option<usize>,
 }
 
 impl SplitPlan {
@@ -42,6 +42,21 @@ impl SplitPlan {
         } else {
             format!("install{part_num}.swm")
         }
+    }
+
+    pub fn total_resources_size(&self) -> u64 {
+        self.parts
+            .iter()
+            .flat_map(|p| p.iter())
+            .map(|&i| self.entries[i].compressed_size)
+            .sum()
+    }
+
+    pub fn part_resources_size(&self, part_num: u16) -> u64 {
+        self.parts[(part_num - 1) as usize]
+            .iter()
+            .map(|&i| self.entries[i].compressed_size)
+            .sum()
     }
 }
 
@@ -130,13 +145,24 @@ pub fn plan_split<R: Read + Seek>(source: &mut R, max_part_size: u64) -> Result<
         }
     }
 
+    // Find the boot metadata entry so we can update its offset in each part's header
+    let boot_offset = header.boot_metadata_offset();
+    let boot_size = header.boot_metadata_compressed_size();
+    let boot_metadata_idx = if boot_size > 0 {
+        entries
+            .iter()
+            .position(|e| e.source_offset == boot_offset && e.compressed_size == boot_size)
+    } else {
+        None
+    };
+
     Ok(SplitPlan {
         header,
         entries,
         xml_data,
-        lt_size,
         parts,
         assignments,
+        boot_metadata_idx,
     })
 }
 
@@ -156,15 +182,27 @@ pub fn write_part<R: Read + Seek, W: Write>(
         .iter()
         .map(|&i| plan.entries[i].compressed_size)
         .sum();
+    let part_lt_size = (resources.len() * LOOKUP_ENTRY_SIZE) as u64;
     let lt_new_offset = HEADER_SIZE as u64 + resources_data_size;
-    let xml_new_offset = lt_new_offset + plan.lt_size;
+    let xml_new_offset = lt_new_offset + part_lt_size;
 
     // Header
     let mut part_header = plan.header.clone();
+    part_header.set_spanned_flag();
     part_header.set_part_info(part_num, total_parts);
-    part_header.set_lookup_table(lt_new_offset, plan.lt_size);
+    part_header.set_lookup_table(lt_new_offset, part_lt_size);
     part_header.set_xml_data(xml_new_offset, plan.xml_data.len() as u64);
     part_header.clear_integrity();
+
+    if let Some(boot_idx) = plan.boot_metadata_idx {
+        let (boot_part, boot_new_offset) = plan.assignments[boot_idx];
+        if boot_part == part_num {
+            part_header.set_boot_metadata_offset(boot_new_offset);
+        } else {
+            part_header.clear_boot_metadata();
+        }
+    }
+
     writer.write_all(&part_header.raw)?;
 
     // Resources
@@ -184,15 +222,17 @@ pub fn write_part<R: Read + Seek, W: Write>(
         on_progress(copied, resources_data_size);
     }
 
-    // Lookup table (all entries, with assignments)
-    for (i, entry) in plan.entries.iter().enumerate() {
-        let (assigned_part, new_offset) = plan.assignments[i];
-        let serialized = entry.serialize(assigned_part, new_offset);
+    // Lookup table (only entries for this part)
+    for &idx in resources {
+        let (_, new_offset) = plan.assignments[idx];
+        let serialized = plan.entries[idx].serialize(part_num, new_offset);
         writer.write_all(&serialized)?;
     }
 
     // XML data
     writer.write_all(&plan.xml_data)?;
+
+    writer.flush()?;
 
     Ok(())
 }
@@ -225,25 +265,50 @@ impl WimHeader {
         u64::from_le_bytes(self.raw[72..80].try_into().unwrap()) & 0x00FF_FFFF_FFFF_FFFF
     }
 
+    fn set_spanned_flag(&mut self) {
+        let flags = u32::from_le_bytes(self.raw[16..20].try_into().unwrap());
+        self.raw[16..20].copy_from_slice(&(flags | 0x08).to_le_bytes());
+    }
+
     fn set_part_info(&mut self, part: u16, total: u16) {
         self.raw[40..42].copy_from_slice(&part.to_le_bytes());
         self.raw[42..44].copy_from_slice(&total.to_le_bytes());
     }
 
     fn set_lookup_table(&mut self, offset: u64, size: u64) {
-        let size_with_flags = size | (0x02u64 << 56);
+        let orig_flags = self.raw[55]; // preserve flags byte
+        let size_with_flags = size | ((orig_flags as u64) << 56);
         self.raw[48..56].copy_from_slice(&size_with_flags.to_le_bytes());
         self.raw[56..64].copy_from_slice(&offset.to_le_bytes());
         self.raw[64..72].copy_from_slice(&size.to_le_bytes());
     }
 
     fn set_xml_data(&mut self, offset: u64, size: u64) {
-        self.raw[72..80].copy_from_slice(&size.to_le_bytes());
+        let orig_flags = self.raw[79]; // preserve flags byte
+        let size_with_flags = size | ((orig_flags as u64) << 56);
+        self.raw[72..80].copy_from_slice(&size_with_flags.to_le_bytes());
         self.raw[80..88].copy_from_slice(&offset.to_le_bytes());
+        self.raw[88..96].copy_from_slice(&size.to_le_bytes());
+    }
+
+    fn boot_metadata_offset(&self) -> u64 {
+        u64::from_le_bytes(self.raw[104..112].try_into().unwrap())
+    }
+
+    fn boot_metadata_compressed_size(&self) -> u64 {
+        u64::from_le_bytes(self.raw[96..104].try_into().unwrap()) & 0x00FF_FFFF_FFFF_FFFF
+    }
+
+    fn set_boot_metadata_offset(&mut self, offset: u64) {
+        self.raw[104..112].copy_from_slice(&offset.to_le_bytes());
+    }
+
+    fn clear_boot_metadata(&mut self) {
+        self.raw[96..120].fill(0);
     }
 
     fn clear_integrity(&mut self) {
-        self.raw[128..152].fill(0);
+        self.raw[124..148].fill(0);
     }
 }
 
@@ -337,7 +402,7 @@ mod tests {
     #[ignore]
     fn test_wim_split_plan() {
         let iso_path =
-            Path::new("/Users/xatter/code/mediacreationtool/Win10_22H2_English_x32v1.iso");
+            Path::new("/Users/xatter/code/mediacreationtool/winiso-rs/Win11_25H2_English_x64_v2.iso");
         if !iso_path.exists() {
             return;
         }
@@ -389,7 +454,7 @@ mod tests {
     #[ignore]
     fn test_wim_write_part1_header() {
         let iso_path =
-            Path::new("/Users/xatter/code/mediacreationtool/Win10_22H2_English_x32v1.iso");
+            Path::new("/Users/xatter/code/mediacreationtool/winiso-rs/Win11_25H2_English_x64_v2.iso");
         if !iso_path.exists() {
             return;
         }
@@ -414,9 +479,10 @@ mod tests {
             .iter()
             .map(|&i| plan.entries[i].compressed_size)
             .sum();
-        hdr.set_lookup_table(HEADER_SIZE as u64 + resources_size, plan.lt_size);
+        let part1_lt_size = (plan.parts[0].len() * LOOKUP_ENTRY_SIZE) as u64;
+        hdr.set_lookup_table(HEADER_SIZE as u64 + resources_size, part1_lt_size);
         hdr.set_xml_data(
-            HEADER_SIZE as u64 + resources_size + plan.lt_size,
+            HEADER_SIZE as u64 + resources_size + part1_lt_size,
             plan.xml_data.len() as u64,
         );
         hdr.clear_integrity();
@@ -428,5 +494,198 @@ mod tests {
         assert_eq!(total, plan.total_parts());
         println!("Part 1 header: part {part_num}/{total}, resources: {resources_size} bytes");
         println!("Header verified OK");
+    }
+
+    #[test]
+    #[ignore]
+    fn test_wim_write_verify() {
+        let iso_path =
+            Path::new("/Users/xatter/code/mediacreationtool/winiso-rs/Win11_25H2_English_x64_v2.iso");
+        if !iso_path.exists() {
+            return;
+        }
+
+        let mut iso = crate::iso::IsoReader::open(iso_path).unwrap();
+        let entries = iso.list_files().unwrap();
+        let wim_entry = entries
+            .iter()
+            .find(|e| e.path.to_lowercase().ends_with("install.wim"))
+            .unwrap();
+
+        let mut reader = IsoFileReader::new(&mut iso, wim_entry);
+        let plan = plan_split(&mut reader, 0).unwrap();
+
+        // Write part 1 to memory (just header + first few resources + LT + XML)
+        // We'll write a truncated version: header + LT + XML only (skip resources)
+        // to verify the lookup table structure
+        // Write part 1 (has metadata) to verify
+        let test_part: u16 = 1;
+        let test_resources_size: u64 = plan.parts[(test_part - 1) as usize]
+            .iter()
+            .map(|&i| plan.entries[i].compressed_size)
+            .sum();
+        println!("Part {test_part}: {} resources, {:.2} GB",
+            plan.parts[(test_part - 1) as usize].len(), test_resources_size as f64 / 1e9);
+
+        let output_path = std::env::temp_dir().join("winiso_test_part.swm");
+        {
+            let mut file = std::fs::File::create(&output_path).unwrap();
+            write_part(&plan, test_part, &mut reader, &mut file, &|_, _| {}).unwrap();
+        }
+
+        // Read back and verify
+        let data = std::fs::read(&output_path).unwrap();
+        println!("Part 2 file size: {} bytes", data.len());
+
+        // Verify header
+        assert_eq!(&data[0..8], b"MSWIM\x00\x00\x00", "Bad magic");
+        let part_num = u16::from_le_bytes(data[40..42].try_into().unwrap());
+        let total = u16::from_le_bytes(data[42..44].try_into().unwrap());
+        println!("Part {part_num}/{total}");
+        assert_eq!(part_num, test_part);
+        assert_eq!(total, plan.total_parts());
+
+        // Verify lookup table location
+        let lt_offset = u64::from_le_bytes(data[56..64].try_into().unwrap());
+        let lt_size_flags = u64::from_le_bytes(data[48..56].try_into().unwrap());
+        let lt_size = lt_size_flags & 0x00FF_FFFF_FFFF_FFFF;
+        println!("LT offset={lt_offset}, size={lt_size}");
+        assert_eq!(lt_offset, HEADER_SIZE as u64 + test_resources_size);
+        let expected_lt_size = (plan.parts[(test_part - 1) as usize].len() * LOOKUP_ENTRY_SIZE) as u64;
+        assert_eq!(lt_size, expected_lt_size, "LT size should only include entries for this part");
+
+        // Read lookup table from output and verify entries
+        let lt_start = lt_offset as usize;
+        let lt_end = lt_start + lt_size as usize;
+        assert!(lt_end <= data.len(), "LT extends past file end");
+
+        let num_lt_entries = plan.parts[(test_part - 1) as usize].len();
+        for i in 0..num_lt_entries {
+            let off = lt_start + i * LOOKUP_ENTRY_SIZE;
+            let entry_part = u16::from_le_bytes(data[off + 24..off + 26].try_into().unwrap());
+            assert_eq!(entry_part, test_part,
+                "Entry {i} should have part_number={test_part}, got {entry_part}");
+        }
+        println!("  Part {test_part}: {num_lt_entries} entries (all with correct part_number)");
+
+        // Verify resources in the test part are at the right offset
+        let test_idx = (test_part - 1) as usize;
+        for &idx in &plan.parts[test_idx][..3.min(plan.parts[test_idx].len())] {
+            let (assigned_part, assigned_offset) = plan.assignments[idx];
+            assert_eq!(assigned_part, test_part);
+            // Check the data at assigned_offset matches what we'd read from source
+            let res_start = assigned_offset as usize;
+            println!("  Resource {idx}: offset={assigned_offset}, size={}", plan.entries[idx].compressed_size);
+            // First 4 bytes of resource data in the output file
+            if res_start + 4 <= data.len() {
+                let first_bytes = &data[res_start..res_start + 4];
+                // Read same from source
+                reader.seek(SeekFrom::Start(plan.entries[idx].source_offset)).unwrap();
+                let mut src_buf = [0u8; 4];
+                reader.read_exact(&mut src_buf).unwrap();
+                assert_eq!(first_bytes, &src_buf, "Resource {idx} data mismatch at offset {assigned_offset}");
+                println!("    Data verified OK (first 4 bytes: {:02x}{:02x}{:02x}{:02x})",
+                    first_bytes[0], first_bytes[1], first_bytes[2], first_bytes[3]);
+            }
+        }
+
+        // Verify XML data
+        let xml_offset = u64::from_le_bytes(data[80..88].try_into().unwrap()) as usize;
+        let xml_size_flags = u64::from_le_bytes(data[72..80].try_into().unwrap());
+        let xml_size = (xml_size_flags & 0x00FF_FFFF_FFFF_FFFF) as usize;
+        assert_eq!(&data[xml_offset..xml_offset + 4], &plan.xml_data[..4], "XML data mismatch");
+        println!("XML at offset {xml_offset}, size {xml_size} — verified OK");
+
+        std::fs::remove_file(&output_path).ok();
+        println!("\nAll verifications passed!");
+    }
+
+    #[test]
+    #[ignore]
+    fn test_dump_wim_header() {
+        let iso_path =
+            Path::new("/Users/xatter/code/mediacreationtool/winiso-rs/Win11_25H2_English_x64_v2.iso");
+        if !iso_path.exists() {
+            return;
+        }
+
+        let mut iso = crate::iso::IsoReader::open(iso_path).unwrap();
+        let entries = iso.list_files().unwrap();
+        let wim_entry = entries
+            .iter()
+            .find(|e| e.path.to_lowercase().ends_with("install.wim"))
+            .unwrap();
+
+        let mut reader = IsoFileReader::new(&mut iso, wim_entry);
+        let plan = plan_split(&mut reader, 0).unwrap();
+        let h = &plan.header.raw;
+
+        println!("=== Original WIM Header ===");
+        println!("Magic: {:?}", std::str::from_utf8(&h[0..8]));
+        println!("Header size: {}", u32::from_le_bytes(h[8..12].try_into().unwrap()));
+        println!("Version: {}", u32::from_le_bytes(h[12..16].try_into().unwrap()));
+        println!("Flags: 0x{:08x}", u32::from_le_bytes(h[16..20].try_into().unwrap()));
+        println!("Part: {}/{}", u16::from_le_bytes(h[40..42].try_into().unwrap()),
+            u16::from_le_bytes(h[42..44].try_into().unwrap()));
+        println!("Image count: {}", u32::from_le_bytes(h[44..48].try_into().unwrap()));
+
+        // Lookup table reshdr (48-71)
+        let lt_size_flags = u64::from_le_bytes(h[48..56].try_into().unwrap());
+        let lt_flags = (lt_size_flags >> 56) as u8;
+        let lt_size = lt_size_flags & 0x00FF_FFFF_FFFF_FFFF;
+        let lt_offset = u64::from_le_bytes(h[56..64].try_into().unwrap());
+        let lt_orig = u64::from_le_bytes(h[64..72].try_into().unwrap());
+        println!("\nLookup table reshdr (48-71):");
+        println!("  size_flags=0x{lt_size_flags:016x} (flags=0x{lt_flags:02x}, size={lt_size})");
+        println!("  offset={lt_offset}");
+        println!("  original_size={lt_orig}");
+        println!("  entries: {}", lt_size / 50);
+
+        // XML data reshdr (72-95)
+        let xml_size_flags = u64::from_le_bytes(h[72..80].try_into().unwrap());
+        let xml_flags = (xml_size_flags >> 56) as u8;
+        let xml_size = xml_size_flags & 0x00FF_FFFF_FFFF_FFFF;
+        let xml_offset = u64::from_le_bytes(h[80..88].try_into().unwrap());
+        let xml_orig = u64::from_le_bytes(h[88..96].try_into().unwrap());
+        println!("\nXML data reshdr (72-95):");
+        println!("  size_flags=0x{xml_size_flags:016x} (flags=0x{xml_flags:02x}, size={xml_size})");
+        println!("  offset={xml_offset}");
+        println!("  original_size={xml_orig}");
+
+        // Boot metadata reshdr (96-119)
+        let boot_size_flags = u64::from_le_bytes(h[96..104].try_into().unwrap());
+        let boot_flags = (boot_size_flags >> 56) as u8;
+        let boot_size = boot_size_flags & 0x00FF_FFFF_FFFF_FFFF;
+        let boot_offset = u64::from_le_bytes(h[104..112].try_into().unwrap());
+        let boot_orig = u64::from_le_bytes(h[112..120].try_into().unwrap());
+        println!("\nBoot metadata reshdr (96-119):");
+        println!("  size_flags=0x{boot_size_flags:016x} (flags=0x{boot_flags:02x}, size={boot_size})");
+        println!("  offset={boot_offset}");
+        println!("  original_size={boot_orig}");
+
+        // Boot index (120-123)
+        println!("\nBoot index: {}", u32::from_le_bytes(h[120..124].try_into().unwrap()));
+
+        // Integrity reshdr (124-147)
+        let int_size_flags = u64::from_le_bytes(h[124..132].try_into().unwrap());
+        let int_flags = (int_size_flags >> 56) as u8;
+        let int_size = int_size_flags & 0x00FF_FFFF_FFFF_FFFF;
+        let int_offset = u64::from_le_bytes(h[132..140].try_into().unwrap());
+        let int_orig = u64::from_le_bytes(h[140..148].try_into().unwrap());
+        println!("\nIntegrity reshdr (124-147):");
+        println!("  size_flags=0x{int_size_flags:016x} (flags=0x{int_flags:02x}, size={int_size})");
+        println!("  offset={int_offset}");
+        println!("  original_size={int_orig}");
+
+        // Check what our clear_integrity currently clears (128-152)
+        println!("\nBytes 124-152 hex:");
+        for i in (124..152).step_by(8) {
+            let end = (i + 8).min(152);
+            print!("  [{i}..{end}]: ");
+            for b in &h[i..end] {
+                print!("{b:02x} ");
+            }
+            println!();
+        }
     }
 }

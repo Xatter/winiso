@@ -1,5 +1,5 @@
 use std::fs::OpenOptions;
-use std::io;
+use std::io::{self, Write as _};
 use std::path::Path;
 
 use fatfs::{FatType, FileSystem, FormatVolumeOptions, FsOptions};
@@ -84,6 +84,9 @@ pub fn copy_iso_to_fat32(
         };
 
         iso.copy_file_to(entry, &mut progress_writer)?;
+        progress_writer.flush().map_err(|e| {
+            Error::Other(format!("Failed to flush '{}': {e}", entry.path))
+        })?;
     }
 
     on_progress(total_size, total_size);
@@ -139,6 +142,8 @@ pub fn split_wim_to_fat32(
     let root = fs.root_dir();
 
     let mut filenames = Vec::new();
+    let total_size = plan.total_resources_size();
+    let mut base_written: u64 = 0;
 
     for part_num in 1..=total_parts {
         let filename = plan.part_filename(part_num);
@@ -149,8 +154,12 @@ pub fn split_wim_to_fat32(
             .map_err(|e| Error::Other(format!("Failed to create '{fat_path}': {e}")))?;
 
         eprintln!("  Writing {filename}...");
-        wim::write_part(&plan, part_num, &mut wim_reader, &mut fat_file, on_progress)?;
+        let base = base_written;
+        wim::write_part(&plan, part_num, &mut wim_reader, &mut fat_file, &|current, _| {
+            on_progress(base + current, total_size);
+        })?;
 
+        base_written += plan.part_resources_size(part_num);
         filenames.push(filename);
     }
 
