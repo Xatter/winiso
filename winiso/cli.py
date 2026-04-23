@@ -40,6 +40,14 @@ def main(argv: list[str] | None = None) -> None:
     dl_parser.add_argument("-o", "--output", type=Path, default=Path("."), help="Output directory")
     dl_parser.add_argument("--iso", action="store_true", help="Use ISO API (default: ESD from catalog)")
 
+    burn_parser = sub.add_parser("burn", help="Write an ISO to a USB drive")
+    burn_parser.add_argument("iso", nargs="?", type=Path, help="Path to ISO file")
+    burn_parser.add_argument("--version", choices=["10", "11"], help="Windows version (downloads ISO if no file given)")
+    burn_parser.add_argument("--lang", help="Language for auto-download")
+    burn_parser.add_argument("--arch", default="x64", help="Architecture (default: x64)")
+    burn_parser.add_argument("--drive", help="Target drive (e.g. /dev/disk2, /dev/sdb)")
+    burn_parser.add_argument("-y", "--yes", action="store_true", help="Skip confirmation (DANGEROUS)")
+
     args = parser.parse_args(argv)
 
     if args.command is None:
@@ -48,6 +56,8 @@ def main(argv: list[str] | None = None) -> None:
         _list_command(args)
     elif args.command == "download":
         _download_command(args)
+    elif args.command == "burn":
+        _burn_command(args)
 
 
 def _normalize_arch(arch: str) -> str:
@@ -302,3 +312,74 @@ def _resolve_language(languages: list[Language], lang_filter: str | None) -> Lan
         (l for l in languages if l.id == "en-us" or "english" in l.name.lower()),
         languages[0],
     )
+
+
+# --- Burn command ---
+
+
+def _burn_command(args: argparse.Namespace) -> None:
+    from .burn import burn_iso, confirm_burn, resolve_iso_source
+    from .models import UsbDrive
+    from .usb import UsbError, list_usb_drives
+
+    arch = _normalize_arch(args.arch)
+    output_dir = Path.cwd()
+
+    iso_path = resolve_iso_source(
+        iso_path=args.iso,
+        version=f"windows{args.version}" if args.version else None,
+        lang=args.lang,
+        arch=arch,
+        output_dir=output_dir,
+        console=console,
+    )
+
+    try:
+        drives = list_usb_drives()
+    except UsbError as e:
+        console.print(f"[red]{e}[/red]")
+        sys.exit(1)
+
+    if not drives:
+        console.print("[red]No removable USB drives found.[/red]")
+        console.print("[dim]Insert a USB drive and try again.[/dim]")
+        sys.exit(1)
+
+    if args.drive:
+        drive = next((d for d in drives if d.device == args.drive), None)
+        if not drive:
+            console.print(f"[red]Drive {args.drive} not found or not removable.[/red]")
+            console.print("Available drives: " + ", ".join(d.device for d in drives))
+            sys.exit(1)
+    else:
+        drive = _pick_drive(drives)
+
+    if not args.yes:
+        if not confirm_burn(drive, iso_path, console):
+            console.print("Cancelled.")
+            sys.exit(0)
+
+    burn_iso(iso_path, drive, console)
+
+
+def _pick_drive(drives: list) -> object:
+    console.print("\nAvailable USB drives:\n")
+    table = Table()
+    table.add_column("#", style="bold cyan")
+    table.add_column("Device", style="dim")
+    table.add_column("Name")
+    table.add_column("Size")
+    for i, d in enumerate(drives, 1):
+        size_gb = d.size / (1024 ** 3)
+        table.add_row(str(i), d.device, d.name, f"{size_gb:.1f} GB")
+    console.print(table)
+    console.print()
+    while True:
+        choice = console.input("[bold]Select drive[/bold]: ").strip()
+        try:
+            idx = int(choice) - 1
+            if 0 <= idx < len(drives):
+                return drives[idx]
+        except ValueError:
+            pass
+        console.print(f"[red]Please enter a number between 1 and {len(drives)}[/red]")

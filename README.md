@@ -48,6 +48,16 @@ winiso download --version 10 --lang de-de -o ~/Downloads   # German Win10, custo
 
 Downloads are resumable — if interrupted, just run the same command again.
 
+### Create bootable USB
+
+```bash
+winiso burn Win11_24H2_English_x64.iso              # Write ISO to USB (interactive drive selection)
+winiso burn --version 11 --lang en-us                # Download ISO and burn in one step
+winiso burn Win11.iso --drive /dev/disk2             # Specify drive directly
+```
+
+Detects your OS and uses built-in tools (`dd` on macOS/Linux). Lists only physical removable drives, requires you to type the device name to confirm before writing. Supports macOS and Linux.
+
 ## How it works
 
 winiso uses the same `products.cab` catalog that Microsoft's own Media Creation Tool uses internally. It:

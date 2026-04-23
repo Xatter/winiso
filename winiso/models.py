@@ -24,3 +24,12 @@ class DownloadLink:
     filename: str
     size: int | None = None
     sha256: str | None = None
+
+
+@dataclass
+class UsbDrive:
+    device: str
+    name: str
+    size: int
+    removable: bool
+    partitions: list[str] = field(default_factory=list)
