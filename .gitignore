@@ -14,5 +14,11 @@ MediaCreationTool.exe
 # Partial downloads
 *.part
 
+# Rust
+winiso-rs/target/
+
+# ISOs (large binary files)
+*.iso
+
 # OS
 .DS_Store

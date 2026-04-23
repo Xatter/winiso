@@ -1,0 +1,38 @@
+[package]
+name = "winiso"
+version = "0.1.0"
+edition = "2024"
+description = "Cross-platform Windows ISO downloader and bootable USB creator"
+
+[[bin]]
+name = "winiso"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+dialoguer = "0.11"
+indicatif = "0.17"
+console = "0.15"
+reqwest = { version = "0.12", features = ["rustls-tls", "blocking", "cookies", "json"], default-features = false }
+sha1 = "0.10"
+cab = "0.6"
+roxmltree = "0.20"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4"] }
+thiserror = "2"
+byteorder = "1"
+ctrlc = "3"
+digest = "0.10"
+fatfs = "0.3.6"
+fscommon = "0.1.1"
+mbrman = "0.6.1"
+plist = "1.8.0"
+libc = "0.2"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
