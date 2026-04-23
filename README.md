@@ -20,13 +20,13 @@ sudo apt install cabextract  # Ubuntu/Debian
 
 ## Usage
 
-### Interactive mode
+### Interactive wizard
 
 ```bash
 winiso
 ```
 
-Walks you through selecting Windows version, architecture, language, and output directory.
+Walks you through the entire process: select Windows version, architecture, language, pick your USB drive, then downloads the ISO and writes it to the drive. If no USB drive is detected, it downloads the ISO only.
 
 ### List available downloads
 

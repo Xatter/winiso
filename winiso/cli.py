@@ -68,35 +68,101 @@ def _normalize_arch(arch: str) -> str:
 
 
 def _interactive_flow() -> None:
+    from .burn import burn_iso, confirm_burn
+    from .usb import UsbError, list_usb_drives
+
     console.print("[bold]winiso[/bold] - Windows ISO Downloader\n")
 
+    # Step 1-3: Version, arch, language
     version_key = _pick_version()
     arch = _pick_arch()
 
-    console.print(f"\nFetching catalog...")
-    try:
-        entries = fetch_catalog(version_key)
-    except Exception as e:
-        console.print(f"[red]Failed to fetch catalog: {e}[/red]")
-        console.print("[dim]Make sure 'cabextract' is installed (brew install cabextract)[/dim]")
+    product = PRODUCTS[version_key]
+    edition = next((e for e in product["editions"] if e["arch"] == arch), product["editions"][0])
+
+    console.print(f"\nFetching available languages...")
+    with MicrosoftDownloadAPI() as api:
+        try:
+            languages = api.get_languages(edition["id"])
+        except APIError as e:
+            console.print(f"[red]API error: {e.message}[/red]")
+            sys.exit(1)
+
+        if not languages:
+            console.print(f"[red]No languages found for {arch}[/red]")
+            sys.exit(1)
+
+        language = _pick_language(languages)
+
+        # Step 4: Detect USB drives
+        console.print("\nLooking for USB drives...")
+        try:
+            drives = list_usb_drives()
+        except UsbError as e:
+            console.print(f"[red]{e}[/red]")
+            sys.exit(1)
+
+        if not drives:
+            console.print("[yellow]No USB drives found.[/yellow]")
+            console.print("[dim]Insert a USB drive and press Enter to retry, or type 'skip' to download only.[/dim]")
+            while True:
+                answer = console.input("[bold]>[/bold] ").strip().lower()
+                if answer == "skip":
+                    break
+                try:
+                    drives = list_usb_drives()
+                except UsbError:
+                    pass
+                if drives:
+                    break
+                console.print("[dim]Still no drives found. Try again or type 'skip'.[/dim]")
+
+        drive = _pick_drive(drives) if drives else None
+
+        # Step 5: Confirm
+        if drive:
+            size_gb = drive.size / (1024 ** 3)
+            console.print(f"\n[bold]Summary:[/bold]")
+            console.print(f"  Windows:  {product['name']} ({arch})")
+            console.print(f"  Language: {language.name}")
+            console.print(f"  Drive:    {drive.name} ({size_gb:.1f} GB) — {drive.device}")
+            console.print(f"\n  Will download ISO, then write to USB.\n")
+        else:
+            console.print(f"\n[bold]Summary:[/bold]")
+            console.print(f"  Windows:  {product['name']} ({arch})")
+            console.print(f"  Language: {language.name}")
+            console.print(f"\n  Will download ISO to current directory.\n")
+
+        # Step 6: Get download link
+        console.print("Fetching download link...")
+        try:
+            links = api.get_download_links(language.sku_id, product["segment"])
+        except APIError as e:
+            console.print(f"[red]API error: {e.message}[/red]")
+            console.print("[dim]Microsoft's anti-bot may have blocked the request. Try again later.[/dim]")
+            sys.exit(1)
+
+    if not links:
+        console.print("[red]No download links returned.[/red]")
         sys.exit(1)
 
-    languages = get_languages_from_catalog(entries, arch)
-    if not languages:
-        console.print(f"[red]No languages found for {arch}[/red]")
-        sys.exit(1)
+    link = links[0]
+    filename = language.friendly_filename or link.filename
+    output_path = Path.cwd() / filename
 
-    language = _pick_language(languages)
-    link = get_download_link_from_catalog(entries, language.id, arch)
-    if not link:
-        console.print("[red]No download link found[/red]")
-        sys.exit(1)
+    # Step 7: Download
+    console.print(f"\n[bold]Downloading {filename}[/bold]\n")
+    download_file(link.url, output_path, console=console)
 
-    output_dir = _pick_output_dir()
-    output_path = output_dir / link.filename
-
-    _print_download_info(link)
-    download_file(link.url, output_path, expected_size=link.size, console=console)
+    # Step 8: Burn (if drive selected)
+    if drive:
+        console.print()
+        if not confirm_burn(drive, output_path, console):
+            console.print("Burn cancelled. ISO saved to: [bold]{output_path}[/bold]")
+            return
+        burn_iso(output_path, drive, console)
+    else:
+        console.print(f"\nISO saved to: [bold]{output_path}[/bold]")
 
 
 def _pick_version() -> str:
