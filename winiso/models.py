@@ -23,7 +23,7 @@ class DownloadLink:
     url: str
     filename: str
     size: int | None = None
-    sha256: str | None = None
+    sha1: str | None = None
 
 
 @dataclass

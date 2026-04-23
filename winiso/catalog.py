@@ -147,6 +147,6 @@ def get_download_link_from_catalog(
                 url=entry.file_path,
                 filename=entry.filename,
                 size=entry.size,
-                sha256=None,
+                sha1=entry.sha1,
             )
     return None

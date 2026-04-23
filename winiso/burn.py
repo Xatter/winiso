@@ -47,7 +47,7 @@ def _download_iso_for_burn(
     version_key: str, arch: str, lang: str | None, output_dir: Path, console: Console,
 ) -> Path:
     from .api import PRODUCTS, APIError, MicrosoftDownloadAPI
-    from .download import download_file
+    from .download import check_existing, download_file
 
     product = PRODUCTS.get(version_key)
     if not product:
@@ -96,8 +96,9 @@ def _download_iso_for_burn(
     link = links[0]
     filename = language.friendly_filename or link.filename
     output_path = output_dir / filename
-    console.print(f"\nDownloading [bold]{filename}[/bold]...\n")
-    download_file(link.url, output_path, console=console)
+    if not check_existing(output_path, sha1=link.sha1, console=console):
+        console.print(f"\nDownloading [bold]{filename}[/bold]...\n")
+        download_file(link.url, output_path, console=console)
     return output_path
 
 
@@ -117,13 +118,63 @@ def confirm_burn(drive: UsbDrive, iso_path: Path, console: Console) -> bool:
     console.print(Panel(warning, title="[bold red]WARNING[/bold red]", border_style="red"))
 
     short_name = drive.device.split("/")[-1]
-    console.print(f'\nTo confirm, type the device name: [bold]{short_name}[/bold]')
-    answer = console.input("[bold]Confirm[/bold]: ").strip()
+    console.print(f"\nTo confirm, type [bold]{short_name}[/bold] (or 'cancel' to abort)")
+    answer = console.input(f"[bold]Confirm[/bold] [{short_name}]: ").strip()
 
     return answer == short_name
 
 
-def burn_iso(iso_path: Path, drive: UsbDrive, console: Console) -> None:
+def burn_iso(iso_path: Path, drive: UsbDrive, console: Console, *, raw: bool = False) -> None:
+    if raw:
+        _burn_raw(iso_path, drive, console)
+        return
+
+    from .bootusb import create_bootable_usb, preflight_check
+
+    try:
+        preflight_check(iso_path, drive)
+    except UsbError as e:
+        console.print(f"\n[red]{e}[/red]")
+        sys.exit(1)
+
+    console.print("\n[dim]Administrator privileges (sudo) are required.[/dim]")
+    console.print("[dim]Do not remove the USB drive during this process.[/dim]\n")
+
+    progress = Progress(
+        "[progress.description]{task.description}",
+        BarColumn(),
+        DownloadColumn(),
+        TransferSpeedColumn(),
+        console=console,
+    )
+
+    with progress:
+        current_task = None
+        current_phase: str | None = None
+
+        def on_phase(phase: str, completed: int, total: int) -> None:
+            nonlocal current_task, current_phase
+            if phase != current_phase:
+                if current_task is not None:
+                    progress.update(current_task, completed=progress.tasks[current_task].total)
+                current_task = progress.add_task(phase, total=total)
+                current_phase = phase
+            progress.update(current_task, completed=completed, total=total)
+
+        try:
+            create_bootable_usb(iso_path, drive, on_phase=on_phase)
+        except UsbError as e:
+            console.print(f"\n[red]Failed: {e}[/red]")
+            sys.exit(1)
+        except KeyboardInterrupt:
+            console.print("\n[yellow]Interrupted. Cleaning up...[/yellow]")
+            sys.exit(1)
+
+    console.print(f"\n[bold green]Done![/bold green] Bootable USB created from {iso_path.name}")
+    console.print("[dim]You can now safely remove the USB drive.[/dim]")
+
+
+def _burn_raw(iso_path: Path, drive: UsbDrive, console: Console) -> None:
     iso_size = iso_path.stat().st_size
     if iso_size > drive.size:
         iso_gb = iso_size / (1024 ** 3)
@@ -143,7 +194,7 @@ def burn_iso(iso_path: Path, drive: UsbDrive, console: Console) -> None:
     )
 
     with progress:
-        task = progress.add_task("Writing", total=iso_size)
+        task = progress.add_task("Writing (raw)", total=iso_size)
 
         def on_progress(written: int, total: int) -> None:
             progress.update(task, completed=written)

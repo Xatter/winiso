@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import signal
 import sys
 from pathlib import Path
@@ -17,6 +18,43 @@ from rich.progress import (
 
 USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64; rv:100.0) Gecko/20100101 Firefox/100.0"
 CHUNK_SIZE = 1024 * 256  # 256 KB
+
+
+def check_existing(
+    output_path: Path,
+    *,
+    sha1: str | None = None,
+    console: Console | None = None,
+) -> bool:
+    """Return True if file already exists and is valid (skip download)."""
+    console = console or Console()
+    if not output_path.exists():
+        return False
+    if sha1:
+        console.print(f"Found existing [bold]{output_path.name}[/bold], verifying integrity...")
+        if _verify_sha1(output_path, sha1, console):
+            console.print(f"[green]SHA-1 verified — skipping download.[/green]")
+            return True
+        partial_path = output_path.with_suffix(output_path.suffix + ".part")
+        output_path.rename(partial_path)
+        console.print("[yellow]Hash mismatch — resuming download.[/yellow]")
+        return False
+    console.print(f"[green]{output_path.name} already exists — skipping download.[/green]")
+    return True
+
+
+def _verify_sha1(path: Path, expected: str, console: Console) -> bool:
+    sha1 = hashlib.sha1()
+    size = path.stat().st_size
+    with open(path, "rb") as f, _make_progress(console) as progress:
+        task = progress.add_task("Verifying", total=size)
+        while True:
+            chunk = f.read(CHUNK_SIZE)
+            if not chunk:
+                break
+            sha1.update(chunk)
+            progress.update(task, advance=len(chunk))
+    return sha1.hexdigest().lower() == expected.lower()
 
 
 def download_file(

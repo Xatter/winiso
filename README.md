@@ -7,16 +7,13 @@ Microsoft's [Media Creation Tool](https://www.microsoft.com/software-download/wi
 ## Install
 
 ```bash
-# Clone and install
 git clone https://github.com/Xatter/winiso.git
 cd winiso
 python3 -m venv .venv && source .venv/bin/activate
 pip install -e .
-
-# Also need cabextract for catalog parsing
-brew install cabextract    # macOS
-sudo apt install cabextract  # Ubuntu/Debian
 ```
+
+Then install the system dependencies listed under [Requirements](#requirements).
 
 ## Usage
 
@@ -54,9 +51,12 @@ Downloads are resumable — if interrupted, just run the same command again.
 winiso burn Win11_24H2_English_x64.iso              # Write ISO to USB (interactive drive selection)
 winiso burn --version 11 --lang en-us                # Download ISO and burn in one step
 winiso burn Win11.iso --drive /dev/disk2             # Specify drive directly
+winiso burn Win11.iso --raw                          # Raw dd write (advanced, may not boot)
 ```
 
-Detects your OS and uses built-in tools (`dd` on macOS/Linux). Lists only physical removable drives, requires you to type the device name to confirm before writing. Supports macOS and Linux.
+Formats the USB as MBR + FAT32 and copies the Windows installation files, producing a drive that boots on both UEFI and legacy BIOS systems. If the ISO contains an `install.wim` larger than 4 GB (common with Windows 10/11), it automatically splits it using [wimlib](https://wimlib.net/) so it fits on FAT32.
+
+Lists only physical removable drives, requires you to type the device name to confirm before writing. Supports macOS and Linux.
 
 ## How it works
 
@@ -91,6 +91,15 @@ For direct ISO downloads (bypasses ESD), use the `--iso` flag — this uses a di
 
 - Python 3.10+
 - `cabextract` (for parsing Microsoft's product catalog)
+- `wimlib` (optional — only needed if `install.wim` in the ISO exceeds 4 GB)
+
+```bash
+# macOS
+brew install cabextract wimlib
+
+# Ubuntu/Debian
+sudo apt install cabextract wimlib-tools
+```
 
 ## Prior art
 

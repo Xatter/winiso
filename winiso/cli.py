@@ -13,7 +13,7 @@ from .catalog import (
     get_download_link_from_catalog,
     get_languages_from_catalog,
 )
-from .download import download_file
+from .download import check_existing, download_file
 from .models import DownloadLink, Language
 
 console = Console()
@@ -47,6 +47,7 @@ def main(argv: list[str] | None = None) -> None:
     burn_parser.add_argument("--arch", default="x64", help="Architecture (default: x64)")
     burn_parser.add_argument("--drive", help="Target drive (e.g. /dev/disk2, /dev/sdb)")
     burn_parser.add_argument("-y", "--yes", action="store_true", help="Skip confirmation (DANGEROUS)")
+    burn_parser.add_argument("--raw", action="store_true", help="Write ISO as raw image (dd) instead of creating bootable FAT32 USB")
 
     args = parser.parse_args(argv)
 
@@ -150,9 +151,10 @@ def _interactive_flow() -> None:
     filename = language.friendly_filename or link.filename
     output_path = Path.cwd() / filename
 
-    # Step 7: Download
-    console.print(f"\n[bold]Downloading {filename}[/bold]\n")
-    download_file(link.url, output_path, console=console)
+    # Step 7: Download (skip if already present)
+    if not check_existing(output_path, sha1=link.sha1, console=console):
+        console.print(f"\n[bold]Downloading {filename}[/bold]\n")
+        download_file(link.url, output_path, console=console)
 
     # Step 8: Burn (if drive selected)
     if drive:
@@ -319,6 +321,8 @@ def _download_esd(version_key: str, arch: str, lang_filter: str | None, output_d
         sys.exit(1)
 
     output_path = output_dir / link.filename
+    if check_existing(output_path, sha1=link.sha1, console=console):
+        return
     _print_download_info(link)
     download_file(link.url, output_path, expected_size=link.size, console=console)
 
@@ -357,6 +361,8 @@ def _download_iso(version_key: str, arch: str, lang_filter: str | None, output_d
     link = links[0]
     filename = language.friendly_filename or link.filename
     output_path = output_dir / filename
+    if check_existing(output_path, sha1=link.sha1, console=console):
+        return
     console.print(f"\nDownloading [bold]{filename}[/bold]...\n")
     download_file(link.url, output_path, console=console)
 
@@ -425,7 +431,7 @@ def _burn_command(args: argparse.Namespace) -> None:
             console.print("Cancelled.")
             sys.exit(0)
 
-    burn_iso(iso_path, drive, console)
+    burn_iso(iso_path, drive, console, raw=args.raw)
 
 
 def _pick_drive(drives: list) -> object:
